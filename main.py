@@ -1,6 +1,5 @@
 from enum import Enum
 from typing import List, Optional
-import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, ConfigDict
 from elasticsearch import AsyncElasticsearch
@@ -13,17 +12,36 @@ class TradingType(str, Enum):
     TRANSIT = "TRANSIT"
 
 
-# class VehicleType(str, Enum):
-#     deniz = "deniz"
-#     avtomobil = "avtomobil"
-#     demiryollari = "demiryollari"
-#     hava = "hava"
+class VehicleType(str, Enum):
+    demiryolu = "demiryolu"  # ID: 3 - Dəmiryolu nəqliyyatı
+    deniz = "deniz"          # ID: 1 - Dəniz nəqliyyatı
+    avtomobil = "avtomobil"  # ID: 2 - Avtomobil nəqliyyatı
+    hava = "hava"            # ID: 4 - Hava nəqliyyatı
+    
+    def to_id(self) -> int:
+        """Convert vehicle type to numeric ID for Elasticsearch"""
+        mapping = {
+            "deniz": 1,
+            "avtomobil": 2,
+            "demiryolu": 3,
+            "hava": 4
+        }
+        return mapping[self.value]
+
+
+class Trading(BaseModel):
+    id: Optional[str] = None
+    tradeType: str
+    tradeName: str
+    inVehicleId: Optional[int] = None
+    outVehicleId: Optional[int] = None
 
 
 class Filter(BaseModel):
     model_config = ConfigDict(extra="ignore")
     trading_types: List[TradingType] = Field(default_factory=list)
-    # neqliyyat_vasitesi: List[VehicleType] = Field(default_factory=list)
+    in_vehicle_ids: List[VehicleType] = Field(default_factory=list)
+    out_vehicle_ids: List[VehicleType] = Field(default_factory=list)
 
 
 class ElasticDocument(BaseModel):
@@ -33,7 +51,7 @@ class ElasticDocument(BaseModel):
     name_az_d2: Optional[str] = None
     name_az_d3: Optional[str] = None
     name_az_d4: Optional[str] = None
-    tradings: List[TradingType] = Field(default_factory=list)
+    tradings: List[Trading] = Field(default_factory=list)
     Path: Optional[str] = None
 
     @staticmethod
@@ -45,25 +63,14 @@ class ElasticDocument(BaseModel):
     def from_es_hit(hit: dict) -> "ElasticDocument":
         src = hit.get("_source") or {}
         tradings_data = src.get("tradings", [])
-        
-        # Fix: Extract the trading type value from the dictionary
+
         tradings = []
         if tradings_data:
             for t in tradings_data:
                 if isinstance(t, dict):
-                    # Extract the trading type value from the dictionary
-                    trade_type_value = t.get("tradeType") or t.get("trading_type") or t.get("type")
-                    if trade_type_value:
-                        try:
-                            tradings.append(TradingType(trade_type_value))
-                        except ValueError:
-                            # Skip invalid trading types
-                            continue
-                elif isinstance(t, str):
-                    # Handle case where t is already a string
                     try:
-                        tradings.append(TradingType(t))
-                    except ValueError:
+                        tradings.append(Trading(**t))
+                    except Exception:
                         continue
         
         path = ElasticDocument.build_path(
@@ -73,7 +80,7 @@ class ElasticDocument(BaseModel):
         )
         return ElasticDocument(
             id=src.get("id") or hit.get("_id"),
-            Code=src.get("code"),
+            code=src.get("code"),
             name_az_d1=src.get("name_az_d1"),
             name_az_d2=src.get("name_az_d2"),
             name_az_d3=src.get("name_az_d3"),
@@ -151,20 +158,41 @@ def build_es_bool_query(req: SearchRequest) -> dict:
     
     filters = []
     
-    # Apply trading_types filter
+    # Apply trading_types filter on nested field
     if f.trading_types:
         filters.append({
-            "terms": {"tradings.tradeType": [tt.value for tt in f.trading_types]}
+            "nested": {
+                "path": "tradings",
+                "query": {
+                    "terms": {"tradings.tradeType": [tt.value for tt in f.trading_types]}
+                }
+            }
+        })
+    
+    # Apply inVehicleId filter on nested field
+    if f.in_vehicle_ids:
+        filters.append({
+            "nested": {
+                "path": "tradings",
+                "query": {
+                    "terms": {"tradings.inVehicleId": [v.to_id() for v in f.in_vehicle_ids]}
+                }
+            }
+        })
+    
+    # Apply outVehicleId filter on nested field
+    if f.out_vehicle_ids:
+        filters.append({
+            "nested": {
+                "path": "tradings",
+                "query": {
+                    "terms": {"tradings.outVehicleId": [v.to_id() for v in f.out_vehicle_ids]}
+                }
+            }
         })
     
     if filters:
         bool_query["filter"] = filters
-    
-    # Apply vehicle type filter
-    # if f.neqliyyat_vasitesi:
-    #     filters.append({
-    #         "terms": {"transport": [t.value for t in f.neqliyyat_vasitesi]}
-    #     })
     
     query = {
         "function_score": {
@@ -183,7 +211,7 @@ def build_es_bool_query(req: SearchRequest) -> dict:
 # ==================== FastAPI Application ====================
 
 ES_URL = "https://c70506d900e44618bd38984c5803a2ea.us-central1.gcp.cloud.es.io:443"
-ES_API_KEY = "dGZwd1Fab0JSM1hiUzl3WU5Ua2w6N3FOdW5tVHdhSm11enR0SDVBbDdiQQ=="
+ES_API_KEY = "VDVCdlZab0J4Q0dCdlkwSTJEOEg6aFNud3BhSkN0QWxRR1dmVVpCdkotdw=="
 ES_INDEX = "flattened_hscodes"
 
 app = FastAPI(
