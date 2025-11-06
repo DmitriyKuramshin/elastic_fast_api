@@ -3,6 +3,7 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, ConfigDict
 from elasticsearch import AsyncElasticsearch
+import re
 
 # ==================== Data Models ====================
 
@@ -47,6 +48,7 @@ class Filter(BaseModel):
 class ElasticDocument(BaseModel):
     id: str
     code: Optional[str] = None
+    score: Optional[float] = None
     name_az_d1: Optional[str] = None
     name_az_d2: Optional[str] = None
     name_az_d3: Optional[str] = None
@@ -62,6 +64,7 @@ class ElasticDocument(BaseModel):
     @staticmethod
     def from_es_hit(hit: dict) -> "ElasticDocument":
         src = hit.get("_source") or {}
+        score = hit.get("_score")
         tradings_data = src.get("tradings", [])
 
         tradings = []
@@ -81,6 +84,7 @@ class ElasticDocument(BaseModel):
         return ElasticDocument(
             id=src.get("id") or hit.get("_id"),
             code=src.get("code"),
+            score=score,
             name_az_d1=src.get("name_az_d1"),
             name_az_d2=src.get("name_az_d2"),
             name_az_d3=src.get("name_az_d3"),
@@ -111,45 +115,108 @@ class SearchRequest(BaseModel):
 def build_es_bool_query(req: SearchRequest) -> dict:
     f = req.filter
 
-    # Build should clauses for fuzzy matching and prefix matching
+    query_text = req.query.strip()
+    
+    numeric_code = re.sub(r'\D', '', query_text)
+    has_code = len(numeric_code) >= 6
+    
+    # Check if query is ONLY a code (no other characters except digits)
+    is_only_code = query_text.isdigit() and len(query_text) in [6, 8, 10]
+    
     should_clauses = []
     
-    # Fuzzy match queries
-    match_fields = [
-        ("name_az_d1", 0.3),
-        ("name_az_d2", 0.3),
-        ("name_az_d3", 0.3),
-        ("name_az_d4", 1.0),
-    ]
-
-    for field, boost in match_fields:
+    # If query is only a code, use exact prefix matching only
+    if is_only_code:
+        should_clauses.append({
+            "prefix": {
+                "code": {
+                    "value": query_text,
+                    "boost": 10.0
+                }
+            }
+        })
+    else:
+        # Parent fields with slight boosting
+        parent_fields = [
+            ("name_az_d1", 0.15),
+            ("name_az_d2", 0.15),
+            ("name_az_d3", 0.15),
+        ]
+        
+        for field, boost in parent_fields:
+            should_clauses.append({
+                "match": {
+                    field: {
+                        "query": req.query,
+                        "boost": boost,
+                        "fuzziness": "AUTO"
+                    }
+                }
+            })
+            should_clauses.append({
+                "prefix": {
+                    field: {
+                        "value": req.query,
+                        "boost": boost
+                    }
+                }
+            })
+        
+        # name_az_d4 with higher boosting
         should_clauses.append({
             "match": {
-                field: {
+                "name_az_d4": {
                     "query": req.query,
-                    "boost": boost,
+                    "boost": 1.0,
                     "fuzziness": "AUTO"
                 }
             }
         })
-    
-    # Prefix queries
-    prefix_fields = [
-        ("name_az_d1", 1.0),
-        ("name_az_d2", 1.0),
-        ("name_az_d3", 1.0),
-        ("name_az_d4", 2.0),
-    ]
-
-    for field, boost in prefix_fields:
+        
         should_clauses.append({
             "prefix": {
-                field: {
+                "name_az_d4": {
                     "value": req.query,
-                    "boost": boost
+                    "boost": 2.0
                 }
             }
         })
+        
+        # Add code prefix queries with tiered boosting if numeric code is detected
+        if has_code:
+            code_len = len(numeric_code)
+            
+            # Level 1: 6+ characters (base boost)
+            should_clauses.append({
+                "prefix": {
+                    "code": {
+                        "value": numeric_code[:6],
+                        "boost": 10.0
+                    }
+                }
+            })
+            
+            # Level 2: 8+ characters (higher boost)
+            if code_len >= 8:
+                should_clauses.append({
+                    "prefix": {
+                        "code": {
+                            "value": numeric_code[:8],
+                            "boost": 20.0
+                        }
+                    }
+                })
+            
+            # Level 3: 10+ characters (highest boost)
+            if code_len >= 10:
+                should_clauses.append({
+                    "prefix": {
+                        "code": {
+                            "value": numeric_code[:10],
+                            "boost": 30.0
+                        }
+                    }
+                })
     
     bool_query = {
         "should": should_clauses,
@@ -200,7 +267,7 @@ def build_es_bool_query(req: SearchRequest) -> dict:
                 "bool": bool_query
             },
             "functions": [],
-            "score_mode": "sum",
+            "score_mode": "multiply",
             "boost_mode": "multiply"
         }
     }
