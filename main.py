@@ -42,9 +42,9 @@ class Trading(BaseModel):
 
 class Filter(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    trading_types: List[TradingType] = Field(default_factory=list)
-    in_vehicle_ids: List[VehicleType] = Field(default_factory=list)
-    out_vehicle_ids: List[VehicleType] = Field(default_factory=list)
+    trade_type: Optional[TradingType] = Field(default=None, description="Single trade type filter")
+    in_vehicle_ids: List[VehicleType] = Field(default_factory=list, description="Incoming vehicle IDs (applies with trade_type)")
+    out_vehicle_ids: List[VehicleType] = Field(default_factory=list, description="Outgoing vehicle IDs (applies with trade_type)")
 
 
 class ElasticDocument(BaseModel):
@@ -240,38 +240,42 @@ def build_es_bool_query(req: SearchRequest) -> dict:
     
     filters = []
     
-    # Apply trading_types filter on nested field
-    if f.trading_types:
-        filters.append({
-            "nested": {
-                "path": "tradings",
-                "query": {
-                    "terms": {"tradings.tradeType": [tt.value for tt in f.trading_types]}
+    # Apply filters with AND logic: trade_type AND vehicle_ids must match together
+    # If trade_type is specified, we need nested query with must conditions
+    if f.trade_type or f.in_vehicle_ids or f.out_vehicle_ids:
+        # Build nested must conditions for the same trading object
+        nested_must = []
+        
+        # Trade type must match
+        if f.trade_type:
+            nested_must.append({
+                "term": {"tradings.tradeType": f.trade_type.value}
+            })
+        
+        # Build vehicle filters
+        # If both in and out vehicle filters exist, they both must match
+        if f.in_vehicle_ids:
+            nested_must.append({
+                "terms": {"tradings.inVehicleId": [v.to_id() for v in f.in_vehicle_ids]}
+            })
+        
+        if f.out_vehicle_ids:
+            nested_must.append({
+                "terms": {"tradings.outVehicleId": [v.to_id() for v in f.out_vehicle_ids]}
+            })
+        
+        # Add nested query that ensures all conditions match within the same nested object
+        if nested_must:
+            filters.append({
+                "nested": {
+                    "path": "tradings",
+                    "query": {
+                        "bool": {
+                            "must": nested_must
+                        }
+                    }
                 }
-            }
-        })
-    
-    # Apply inVehicleId filter on nested field
-    if f.in_vehicle_ids:
-        filters.append({
-            "nested": {
-                "path": "tradings",
-                "query": {
-                    "terms": {"tradings.inVehicleId": [v.to_id() for v in f.in_vehicle_ids]}
-                }
-            }
-        })
-    
-    # Apply outVehicleId filter on nested field
-    if f.out_vehicle_ids:
-        filters.append({
-            "nested": {
-                "path": "tradings",
-                "query": {
-                    "terms": {"tradings.outVehicleId": [v.to_id() for v in f.out_vehicle_ids]}
-                }
-            }
-        })
+            })
     
     if filters:
         bool_query["filter"] = filters
@@ -401,8 +405,12 @@ async def search(req: SearchRequest) -> HybridRetrievedResponseSet:
     use_vector_search = req.use_vector and app.state.model is not None
     
     if use_vector_search:
-        # Generate query embedding
-        query_vector = app.state.model.encode(req.query).tolist()
+        # Generate query embedding (run in thread pool to avoid blocking)
+        loop = asyncio.get_event_loop()
+        query_vector = await loop.run_in_executor(
+            None, 
+            lambda: app.state.model.encode(req.query).tolist()
+        )
         
         # Build hybrid query with vector similarity
         es_query = build_hybrid_vector_query(req, query_vector)
@@ -551,12 +559,35 @@ async def health_check():
 #
 # Example requests:
 # 
-# Standard BM25 search:
+# Filter by EXPORT with sea transport (deniz):
 # curl -X POST "http://localhost:8000/search" \
 #   -H "Content-Type: application/json" \
-#   -d '{"query": "aluminium", "size": 10, "use_vector": false}'
+#   -d '{
+#     "query": "aluminium",
+#     "filter": {
+#       "trade_type": "TRANSIT",
+#       "in_vehicle_ids": ["avtomobil"]
+#     },
+#     "size": 10,
+#     "use_vector": false
+#   }'
 #
-# Hybrid search with vectors (alpha=0.6 means 60% vector, 40% BM25):
+# Filter by IMPORT with multiple vehicles (AND logic):
 # curl -X POST "http://localhost:8000/search" \
 #   -H "Content-Type: application/json" \
-#   -d '{"query": "aluminium", "size": 10, "use_vector": true, "alpha": 0.6}'
+#   -d '{
+#     "query": "metal",
+#     "filter": {
+#       "trade_type": "IMPORT",
+#       "in_vehicle_ids": ["deniz", "avtomobil"],
+#       "out_vehicle_ids": ["avtomobil"]
+#     },
+#     "size": 10,
+#     "use_vector": false
+#   }'
+#
+# Note: With AND logic, documents must have tradings where:
+# - tradeType matches the selected trade_type
+# - AND inVehicleId is in the in_vehicle_ids list (if specified)
+# - AND outVehicleId is in the out_vehicle_ids list (if specified)
+# All conditions must be satisfied within the SAME nested trading object.
