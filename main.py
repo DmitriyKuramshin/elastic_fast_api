@@ -152,8 +152,9 @@ def build_es_bool_query(req: SearchRequest) -> dict:
             "match": {
                 "name_az_d4": {
                     "query": req.query,
-                    "boost": 5.0,
-                    "fuzziness": "AUTO"
+                    "boost": 2.0,
+                    "fuzziness": 2,
+                    "prefix_length": 2
                 }
             }
         })
@@ -162,7 +163,7 @@ def build_es_bool_query(req: SearchRequest) -> dict:
             "prefix": {
                 "name_az_d4": {
                     "value": req.query,
-                    "boost": 2.0
+                    "boost": 5.0
                 }
             }
         })
@@ -234,7 +235,7 @@ def build_es_bool_query(req: SearchRequest) -> dict:
                 "prefix": {
                     field: {
                         "value": req.query,
-                        "boost": boost * parent_coefficient
+                        "boost": 2.5 * boost * parent_coefficient
                     }
                 }
             })
