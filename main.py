@@ -109,9 +109,15 @@ class HybridRetrievedResponseSet(BaseModel):
 class SearchRequest(BaseModel):
     query: str = Field(min_length=1)
     filter: Filter = Field(default_factory=Filter)
-    size: int = Field(default=10, ge=1, le=200)
+    size: int = Field(default=10, ge=1, le=200, description="Number of results to return (same as top_k)")
+    top_k: Optional[int] = Field(default=None, ge=1, le=200, description="Alias for size parameter (number of top results)")
     alpha: float = Field(default=0.5, ge=0.0, le=1.0, description="Weight for vector similarity (0=BM25 only, 1=vector only)")
     use_vector: bool = Field(default=True, description="Enable vector search in hybrid mode")
+    
+    def model_post_init(self, __context):
+        """If top_k is provided, use it as size"""
+        if self.top_k is not None:
+            self.size = self.top_k
 
 
 # ==================== Query Builder ====================
@@ -329,8 +335,7 @@ def build_hybrid_vector_query(req: SearchRequest, query_vector: List[float]) -> 
 # ==================== FastAPI Application ====================
 
 # Source Elasticsearch (for BM25 search)
-SOURCE_ES_URL = "https://c70506d900e44618bd38984c5803a2ea.us-central1.gcp.cloud.es.io:443"
-SOURCE_ES_API_KEY = "VDVCdlZab0J4Q0dCdlkwSTJEOEg6aFNud3BhSkN0QWxRR1dmVVpCdkotdw=="
+SOURCE_ES_URL = "http://10.3.3.16:9200"
 SOURCE_ES_INDEX = "flattened_hscodes"
 
 # Destination Elasticsearch (for vector search)
@@ -364,7 +369,7 @@ def load_model():
 async def startup():
     """Initialize Elasticsearch connections and load model on startup"""
     # Connect to source ES for BM25 search
-    app.state.es_source = AsyncElasticsearch(hosts=[SOURCE_ES_URL], api_key=SOURCE_ES_API_KEY)
+    app.state.es_source = AsyncElasticsearch(hosts=[SOURCE_ES_URL])
     print(f"✅ Connected to Source Elasticsearch at {SOURCE_ES_URL}")
     
     # Connect to destination ES for vector search
@@ -395,7 +400,7 @@ async def search(req: SearchRequest) -> HybridRetrievedResponseSet:
     Execute a hybrid search query against Elasticsearch.
     
     Args:
-        req: SearchRequest containing query text, filters, size, alpha, and use_vector flag
+        req: SearchRequest containing query text, filters, size/top_k, alpha, and use_vector flag
         
     Returns:
         HybridRetrievedResponseSet with ranked search results
@@ -559,7 +564,7 @@ async def health_check():
 #
 # Example requests:
 # 
-# Filter by EXPORT with sea transport (deniz):
+# Using size parameter:
 # curl -X POST "http://localhost:8000/search" \
 #   -H "Content-Type: application/json" \
 #   -d '{
@@ -572,7 +577,7 @@ async def health_check():
 #     "use_vector": false
 #   }'
 #
-# Filter by IMPORT with multiple vehicles (AND logic):
+# Using top_k parameter (same as size):
 # curl -X POST "http://localhost:8000/search" \
 #   -H "Content-Type: application/json" \
 #   -d '{
@@ -582,12 +587,9 @@ async def health_check():
 #       "in_vehicle_ids": ["deniz", "avtomobil"],
 #       "out_vehicle_ids": ["avtomobil"]
 #     },
-#     "size": 10,
-#     "use_vector": false
+#     "top_k": 10,
+#     "alpha": 0.6,
+#     "use_vector": true
 #   }'
 #
-# Note: With AND logic, documents must have tradings where:
-# - tradeType matches the selected trade_type
-# - AND inVehicleId is in the in_vehicle_ids list (if specified)
-# - AND outVehicleId is in the out_vehicle_ids list (if specified)
-# All conditions must be satisfied within the SAME nested trading object.
+# Note: top_k is an alias for size. You can use either parameter.
