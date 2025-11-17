@@ -122,6 +122,8 @@ class SearchRequest(BaseModel):
 
 # ==================== Query Builder ====================
 
+import re
+
 def build_es_bool_query(req: SearchRequest) -> dict:
     f = req.filter
 
@@ -147,18 +149,29 @@ def build_es_bool_query(req: SearchRequest) -> dict:
             }
         })
     else:
-        # name_az_d4 with higher boosting (this will be the main score)
+        # 1) Exact match on raw field for name_az_d4
+        should_clauses.append({
+            "term": {
+                "name_az_d4.raw": {
+                    "value": query_text,
+                    "boost": 12.0
+                }
+            }
+        })
+
+        # 2) Main fuzzy match for name_az_d4 with prefix_length
         should_clauses.append({
             "match": {
                 "name_az_d4": {
                     "query": req.query,
                     "boost": 2.0,
-                    "fuzziness": 2,
+                    "fuzziness": "AUTO",
                     "prefix_length": 2
                 }
             }
         })
         
+        # 3) Prefix query on name_az_d4 (kept from original)
         should_clauses.append({
             "prefix": {
                 "name_az_d4": {
@@ -168,7 +181,7 @@ def build_es_bool_query(req: SearchRequest) -> dict:
             }
         })
         
-        # Phrase match for exact phrase matching
+        # 4) Phrase match for exact phrase matching
         should_clauses.append({
             "match_phrase": {
                 "name_az_d4": {
@@ -222,15 +235,29 @@ def build_es_bool_query(req: SearchRequest) -> dict:
         ]
         
         for field, boost in parent_fields:
+            # 1) Exact match on raw field for parent names
+            should_clauses.append({
+                "term": {
+                    f"{field}.raw": {
+                        "value": query_text,
+                        "boost": 6.0 * boost * parent_coefficient
+                    }
+                }
+            })
+
+            # 2) Fuzzy match with prefix_length
             should_clauses.append({
                 "match": {
                     field: {
                         "query": req.query,
                         "boost": boost * parent_coefficient,
-                        "fuzziness": "AUTO"
+                        "fuzziness": "AUTO",
+                        "prefix_length": 2
                     }
                 }
             })
+
+            # 3) Prefix query on parent fields (kept from original)
             should_clauses.append({
                 "prefix": {
                     field: {
@@ -336,8 +363,10 @@ def build_hybrid_vector_query(req: SearchRequest, query_vector: List[float]) -> 
 # ==================== FastAPI Application ====================
 
 # Source Elasticsearch (for BM25 search)
-SOURCE_ES_URL = "http://10.3.3.16:9200"
-SOURCE_ES_INDEX = "flattened_hscodes"
+# SOURCE_ES_URL = "http://10.3.3.16:9200"
+SOURCE_ES_URL = "https://c70506d900e44618bd38984c5803a2ea.us-central1.gcp.cloud.es.io:443"
+SOURCE_ES_API_KEY = "VDVCdlZab0J4Q0dCdlkwSTJEOEg6aFNud3BhSkN0QWxRR1dmVVpCdkotdw=="
+SOURCE_ES_INDEX = "flattened_hscodes_v2"
 
 # Destination Elasticsearch (for vector search)
 DEST_ES_URL = "https://8b64d8075c244822b5b7d37c8326f96f.us-central1.gcp.cloud.es.io:443"
@@ -370,7 +399,7 @@ def load_model():
 async def startup():
     """Initialize Elasticsearch connections and load model on startup"""
     # Connect to source ES for BM25 search
-    app.state.es_source = AsyncElasticsearch(hosts=[SOURCE_ES_URL])
+    app.state.es_source = AsyncElasticsearch(hosts=[SOURCE_ES_URL], api_key=SOURCE_ES_API_KEY)
     print(f"✅ Connected to Source Elasticsearch at {SOURCE_ES_URL}")
     
     # Connect to destination ES for vector search
