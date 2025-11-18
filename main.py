@@ -164,7 +164,7 @@ def build_es_bool_query(req: SearchRequest) -> dict:
             "match": {
                 "name_az_d4": {
                     "query": req.query,
-                    "boost": 2.0,
+                    "boost": 3.0,
                     "fuzziness": "AUTO",
                     "prefix_length": 2
                 }
@@ -180,13 +180,14 @@ def build_es_bool_query(req: SearchRequest) -> dict:
                 }
             }
         })
-        
-        # 4) Phrase match for exact phrase matching
+
+        # 4) Keywords search - match query with moderate boost
         should_clauses.append({
-            "match_phrase": {
-                "name_az_d4": {
+            "match": {
+                "keywords_az": {
                     "query": req.query,
-                    "boost": 5.0
+                    "boost": 2.5,
+                    "fuzziness": "1",
                 }
             }
         })
@@ -235,34 +236,14 @@ def build_es_bool_query(req: SearchRequest) -> dict:
         ]
         
         for field, boost in parent_fields:
-            # 1) Exact match on raw field for parent names
-            should_clauses.append({
-                "term": {
-                    f"{field}.raw": {
-                        "value": query_text,
-                        "boost": 6.0 * boost * parent_coefficient
-                    }
-                }
-            })
-
-            # 2) Fuzzy match with prefix_length
+            # 1) Fuzzy match with prefix_length
             should_clauses.append({
                 "match": {
                     field: {
                         "query": req.query,
                         "boost": boost * parent_coefficient,
-                        "fuzziness": "AUTO",
+                        "fuzziness": "1",
                         "prefix_length": 2
-                    }
-                }
-            })
-
-            # 3) Prefix query on parent fields (kept from original)
-            should_clauses.append({
-                "prefix": {
-                    field: {
-                        "value": req.query,
-                        "boost": 2.5 * boost * parent_coefficient
                     }
                 }
             })
@@ -315,15 +296,10 @@ def build_es_bool_query(req: SearchRequest) -> dict:
         bool_query["filter"] = filters
     
     query = {
-        "function_score": {
-            "query": {
-                "bool": bool_query
-            },
-            "functions": [],
-            "score_mode": "multiply",
-            "boost_mode": "multiply"
+        "bool": bool_query
         }
-    }
+
+    print("Constructed ES Query:", query)
     
     return query
 
@@ -335,7 +311,7 @@ def build_hybrid_vector_query(req: SearchRequest, query_vector: List[float]) -> 
     # Build the base BM25 query (without function_score wrapper)
     base_query = build_es_bool_query(req)
     # Extract the bool query from function_score
-    bool_query = base_query["function_score"]["query"]["bool"]
+    bool_query = base_query["bool"]
     
     # Build script_score query for hybrid search
     query = {
@@ -363,9 +339,8 @@ def build_hybrid_vector_query(req: SearchRequest, query_vector: List[float]) -> 
 # ==================== FastAPI Application ====================
 
 # Source Elasticsearch (for BM25 search)
-# SOURCE_ES_URL = "http://10.3.3.16:9200"
-SOURCE_ES_URL = "https://c70506d900e44618bd38984c5803a2ea.us-central1.gcp.cloud.es.io:443"
-SOURCE_ES_API_KEY = "VDVCdlZab0J4Q0dCdlkwSTJEOEg6aFNud3BhSkN0QWxRR1dmVVpCdkotdw=="
+SOURCE_ES_URL = "http://10.3.3.16:9200"
+SOURCE_ES_API_KEY = ""
 SOURCE_ES_INDEX = "flattened_hscodes_v2"
 
 # Destination Elasticsearch (for vector search)
