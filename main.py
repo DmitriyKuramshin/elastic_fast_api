@@ -121,7 +121,6 @@ class SearchRequest(BaseModel):
 
 
 # ==================== Query Builder ====================
-
 import re
 
 def build_es_bool_query(req: SearchRequest) -> dict:
