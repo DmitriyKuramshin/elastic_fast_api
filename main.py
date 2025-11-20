@@ -315,34 +315,54 @@ def build_es_bool_query(req: SearchRequest) -> dict:
 
 
 def build_hybrid_vector_query(req: SearchRequest, query_vector: List[float]) -> dict:
-    """Build hybrid query combining BM25 and vector similarity with filters"""
+    """Hybrid query with parent influence applied to vector similarity"""
+    
     f = req.filter
     
-    # Build the base BM25 query (without function_score wrapper)
+    # Build BM25 bool query (unchanged)
     base_query = build_es_bool_query(req)
-    # Extract the bool query from function_score
     bool_query = base_query["bool"]
-    
-    # Build script_score query for hybrid search
+
+    # Parent weights
+    parent_coefficient = 0.3
+    parent_fields = {
+        "embedding_d1": 1.0 * parent_coefficient,
+        "embedding_d2": 1.5 * parent_coefficient,
+        "embedding_d3": 2.0 * parent_coefficient,
+        "embedding_d4": 1.0  # main leaf, full weight
+    }
+
+    # Script_score vector similarity with parent influence
     query = {
         "script_score": {
-            "query": {
-                "bool": bool_query
-            },
+            "query": {"bool": bool_query},
             "script": {
                 "source": """
+                double cosine = 0.0;
+                
+                // Level embeddings
+                cosine += params.alpha_level1 * (cosineSimilarity(params.query_vector, 'embedding_d1') + 1.0)/2.0;
+                cosine += params.alpha_level2 * (cosineSimilarity(params.query_vector, 'embedding_d2') + 1.0)/2.0;
+                cosine += params.alpha_level3 * (cosineSimilarity(params.query_vector, 'embedding_d3') + 1.0)/2.0;
+                cosine += params.alpha_level4 * (cosineSimilarity(params.query_vector, 'embedding_d4') + 1.0)/2.0;
+                
+                // BM25 score stays unchanged
                 double bm25 = _score / (_score + 10.0);
-                double cosine = (cosineSimilarity(params.query_vector, 'embedding') + 1.0) / 2.0;
+                
                 return params.alpha * cosine + (1 - params.alpha) * bm25;
                 """,
                 "params": {
                     "query_vector": query_vector,
-                    "alpha": req.alpha
+                    "alpha": req.alpha,
+                    "alpha_level1": parent_fields["embedding_d1"],
+                    "alpha_level2": parent_fields["embedding_d2"],
+                    "alpha_level3": parent_fields["embedding_d3"],
+                    "alpha_level4": parent_fields["embedding_d4"],
                 }
             }
         }
     }
-    
+
     return query
 
 def build_highlight_config() -> dict:
