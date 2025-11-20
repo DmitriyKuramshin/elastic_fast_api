@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, Dict
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, ConfigDict
 from elasticsearch import AsyncElasticsearch
@@ -57,6 +57,7 @@ class ElasticDocument(BaseModel):
     name_az_d4: Optional[str] = None
     tradings: List[Trading] = Field(default_factory=list)
     Path: Optional[str] = None
+    highlight: Optional[Dict[str, List[str]]] = None 
 
     @staticmethod
     def build_path(p1, p2, p3):
@@ -93,6 +94,7 @@ class ElasticDocument(BaseModel):
             name_az_d4=src.get("name_az_d4"),
             tradings=tradings,
             Path=path or src.get("Path"),
+            highlight=hit.get("highlight"),  # new
         )
 
 
@@ -113,9 +115,9 @@ class SearchRequest(BaseModel):
     top_k: Optional[int] = Field(default=None, ge=1, le=200, description="Alias for size parameter (number of top results)")
     alpha: float = Field(default=0.5, ge=0.0, le=1.0, description="Weight for vector similarity (0=BM25 only, 1=vector only)")
     use_vector: bool = Field(default=True, description="Enable vector search in hybrid mode")
+    use_highlight: bool = Field(default=False, description="Return Elasticsearch highlight snippets")  # new
     
     def model_post_init(self, __context):
-        """If top_k is provided, use it as size"""
         if self.top_k is not None:
             self.size = self.top_k
 
@@ -148,44 +150,53 @@ def build_es_bool_query(req: SearchRequest) -> dict:
             }
         })
     else:
-        # 1) Exact match on raw field for name_az_d4
+        # 1) Exact match phrase for name_az_d4
         should_clauses.append({
-            "term": {
-                "name_az_d4.raw": {
-                    "value": query_text,
-                    "boost": 12.0
+            "match_phrase": {
+                "name_az_d4": {
+                    "query": query_text,
+                    "boost": 16.0, 
+                    "slop": 1
                 }
             }
         })
 
-        # 2) Main fuzzy match for name_az_d4 with prefix_length
+        # 2) Main fuzzy match for name_az_d4 with match_phrase_prefix
         should_clauses.append({
             "match": {
                 "name_az_d4": {
-                    "query": req.query,
-                    "boost": 3.0,
-                    "fuzziness": "AUTO",
-                    "prefix_length": 2
-                }
-            }
-        })
-        
-        # 3) Prefix query on name_az_d4 (kept from original)
-        should_clauses.append({
-            "prefix": {
-                "name_az_d4": {
-                    "value": req.query,
-                    "boost": 5.0
+                    "query": query_text,
+                    "boost": 8.0,
+                    "fuzziness": "2",
                 }
             }
         })
 
-        # 4) Keywords search - match query with moderate boost
+        should_clauses.append({
+            "match_phrase_prefix": {
+                "name_az_d4": {
+                    "query": query_text,
+                    "max_expansions": 8.0
+                }
+            }
+        })
+
+        # 3) Keywords search - match query with moderate boost
         should_clauses.append({
             "match": {
-                "keywords_az": {
-                    "query": req.query,
-                    "boost": 2.5,
+                "keywords_az_level1": {
+                    "query": query_text,
+                    "boost": 20,
+                    "fuzziness": "2",
+                }
+            }
+        })
+
+        should_clauses.append({
+            "match": {
+                "keywords_az_level2": {
+                    "query": query_text,
+                    "boost": 12,
                     "fuzziness": "1",
                 }
             }
@@ -334,13 +345,27 @@ def build_hybrid_vector_query(req: SearchRequest, query_vector: List[float]) -> 
     
     return query
 
+def build_highlight_config() -> dict:
+    return {
+        "pre_tags": ["<mark>"],
+        "post_tags": ["</mark>"],
+        "fields": {
+            "name_az_d1": {},
+            "name_az_d2": {},
+            "name_az_d3": {},
+            "name_az_d4": {},
+            "keywords_az_level1": {},
+            "keywords_az_level2": {},
+        },
+    }
+
 
 # ==================== FastAPI Application ====================
 
 # Source Elasticsearch (for BM25 search)
 SOURCE_ES_URL = "http://10.3.3.16:9200"
 SOURCE_ES_API_KEY = ""
-SOURCE_ES_INDEX = "flattened_hscodes_v2"
+SOURCE_ES_INDEX = "flattened_hscodes_v4"
 
 # Destination Elasticsearch (for vector search)
 DEST_ES_URL = "https://8b64d8075c244822b5b7d37c8326f96f.us-central1.gcp.cloud.es.io:443"
@@ -413,6 +438,8 @@ async def search(req: SearchRequest) -> HybridRetrievedResponseSet:
     # Check if vector search is enabled and model is available
     use_vector_search = req.use_vector and app.state.model is not None
     
+    highlight_conf = build_highlight_config() if req.use_highlight else None
+
     if use_vector_search:
         # Generate query embedding (run in thread pool to avoid blocking)
         loop = asyncio.get_event_loop()
@@ -424,20 +451,24 @@ async def search(req: SearchRequest) -> HybridRetrievedResponseSet:
         # Build hybrid query with vector similarity
         es_query = build_hybrid_vector_query(req, query_vector)
         
-        # Use destination ES with embeddings
+        es_query = build_es_bool_query(req)
+
         try:
-            resp = await app.state.es_dest.search(
-                index=DEST_ES_INDEX,
-                query=es_query,
-                size=req.size
-            )
+            search_kwargs = {
+                "index": SOURCE_ES_INDEX,
+                "query": es_query,
+                "size": req.size,
+            }
+            if highlight_conf:
+                search_kwargs["highlight"] = highlight_conf
+
+            resp = await app.state.es_source.search(**search_kwargs)
         except Exception as e:
             raise HTTPException(
                 status_code=502,
-                detail=f"Elasticsearch (vector) error: {e}"
+                detail=f"Elasticsearch (BM25) error: {e}"
             )
         
-        # Parse hits from vector search
         hits_data = (resp or {}).get("hits", {})
         hits = hits_data.get("hits", []) or []
         total_hits = hits_data.get("total", {})
@@ -453,28 +484,37 @@ async def search(req: SearchRequest) -> HybridRetrievedResponseSet:
         # Fetch full documents from source ES using codes
         if vector_results:
             try:
-                # Build a query to fetch documents by codes
                 codes_list = list(vector_results.keys())
-                fetch_resp = await app.state.es_source.search(
-                    index=SOURCE_ES_INDEX,
-                    query={
-                        "terms": {
-                            "code": codes_list
-                        }
-                    },
-                    size=len(codes_list)
-                )
+
+                fetch_query = {
+                    "terms": {
+                        "code": codes_list
+                    }
+                }
+
+                fetch_kwargs = {
+                    "index": SOURCE_ES_INDEX,
+                    "query": fetch_query,
+                    "size": len(codes_list),
+                }
+
+                if highlight_conf:
+                    # use the BM25 style bool query to drive highlighting
+                    fetch_highlight = {
+                        **highlight_conf,
+                        "highlight_query": build_es_bool_query(req),
+                    }
+                    fetch_kwargs["highlight"] = fetch_highlight
+
+                fetch_resp = await app.state.es_source.search(**fetch_kwargs)
                 
-                # Build a map of code -> full document
                 full_docs = {}
                 for hit in fetch_resp.get("hits", {}).get("hits", []):
                     code = hit.get("_source", {}).get("code")
                     if code:
-                        # Replace the score with the vector search score
                         hit["_score"] = vector_results.get(code, 0.0)
                         full_docs[code] = hit
                 
-                # Rebuild hits in the order of vector search results
                 enriched_hits = []
                 for code in codes_list:
                     if code in full_docs:
