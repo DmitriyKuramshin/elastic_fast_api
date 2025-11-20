@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import List, Optional, Dict
+from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, ConfigDict
 from elasticsearch import AsyncElasticsearch
@@ -57,7 +57,6 @@ class ElasticDocument(BaseModel):
     name_az_d4: Optional[str] = None
     tradings: List[Trading] = Field(default_factory=list)
     Path: Optional[str] = None
-    highlight: Optional[Dict[str, List[str]]] = None 
 
     @staticmethod
     def build_path(p1, p2, p3):
@@ -94,7 +93,6 @@ class ElasticDocument(BaseModel):
             name_az_d4=src.get("name_az_d4"),
             tradings=tradings,
             Path=path or src.get("Path"),
-            highlight=hit.get("highlight"),  # new
         )
 
 
@@ -115,9 +113,9 @@ class SearchRequest(BaseModel):
     top_k: Optional[int] = Field(default=None, ge=1, le=200, description="Alias for size parameter (number of top results)")
     alpha: float = Field(default=0.5, ge=0.0, le=1.0, description="Weight for vector similarity (0=BM25 only, 1=vector only)")
     use_vector: bool = Field(default=True, description="Enable vector search in hybrid mode")
-    use_highlight: bool = Field(default=False, description="Return Elasticsearch highlight snippets")  # new
     
     def model_post_init(self, __context):
+        """If top_k is provided, use it as size"""
         if self.top_k is not None:
             self.size = self.top_k
 
@@ -150,53 +148,44 @@ def build_es_bool_query(req: SearchRequest) -> dict:
             }
         })
     else:
-        # 1) Exact match phrase for name_az_d4
+        # 1) Exact match on raw field for name_az_d4
         should_clauses.append({
-            "match_phrase": {
-                "name_az_d4": {
-                    "query": query_text,
-                    "boost": 16.0, 
-                    "slop": 1
+            "term": {
+                "name_az_d4.raw": {
+                    "value": query_text,
+                    "boost": 12.0
                 }
             }
         })
 
-        # 2) Main fuzzy match for name_az_d4 with match_phrase_prefix
+        # 2) Main fuzzy match for name_az_d4 with prefix_length
         should_clauses.append({
             "match": {
                 "name_az_d4": {
-                    "query": query_text,
-                    "boost": 8.0,
-                    "fuzziness": "2",
+                    "query": req.query,
+                    "boost": 3.0,
+                    "fuzziness": "AUTO",
+                    "prefix_length": 2
                 }
             }
         })
-
+        
+        # 3) Prefix query on name_az_d4 (kept from original)
         should_clauses.append({
-            "match_phrase_prefix": {
+            "prefix": {
                 "name_az_d4": {
-                    "query": query_text,
-                    "max_expansions": 8.0
+                    "value": req.query,
+                    "boost": 5.0
                 }
             }
         })
 
-        # 3) Keywords search - match query with moderate boost
+        # 4) Keywords search - match query with moderate boost
         should_clauses.append({
             "match": {
-                "keywords_az_level1": {
-                    "query": query_text,
-                    "boost": 20,
-                    "fuzziness": "2",
-                }
-            }
-        })
-
-        should_clauses.append({
-            "match": {
-                "keywords_az_level2": {
-                    "query": query_text,
-                    "boost": 12,
+                "keywords_az": {
+                    "query": req.query,
+                    "boost": 2.5,
                     "fuzziness": "1",
                 }
             }
@@ -345,18 +334,174 @@ def build_hybrid_vector_query(req: SearchRequest, query_vector: List[float]) -> 
     
     return query
 
-def build_highlight_config() -> dict:
+
+# ==================== Organization Models ====================
+ORGANIZATIONS_INDEX = "organizations_v4"
+class OrganizationDocument(BaseModel):
+    """Model for organization search results"""
+    id: Optional[str] = None
+    name: Optional[str] = None
+    code: Optional[str] = None
+    score: Optional[float] = None
+    
+    @staticmethod
+    def from_es_hit(hit: dict) -> "OrganizationDocument":
+        """Convert Elasticsearch hit to OrganizationDocument"""
+        src = hit.get("_source") or {}
+        score = hit.get("_score")
+        
+        return OrganizationDocument(
+            id=src.get("id") or hit.get("_id"),
+            name=src.get("name"),
+            code=src.get("code"),
+            score=score
+        )
+
+
+class OrganizationSearchRequest(BaseModel):
+    """Request model for organization search"""
+    search_term: str = Field(min_length=1, description="Organization name or abbreviation to search")
+    index: str = Field(default=ORGANIZATIONS_INDEX, description="Elasticsearch index name")
+    size: int = Field(default=10, ge=1, le=200, description="Number of results to return")
+
+
+class OrganizationSearchResponse(BaseModel):
+    """Response model for organization search"""
+    model_config = ConfigDict(populate_by_name=True)
+    search_term: str = Field(alias="search-term")
+    total_hits: int = Field(alias="total-hits")
+    results: List[OrganizationDocument] = Field(default_factory=list)
+
+
+# Organization abbreviation mapping
+ORGANIZATION_ABBREVIATIONS = {
+    "RGEM": "Səhiyyə Nazirliyi Respublika Gigiyena və Epidemiologiya Mərkəzi",
+    "ADY": "Azərbaycan Dəmir Yolları",
+    "İSB": "İcbari Sığorta Bürosu",
+    "AZRSKM": 'Səhiyyə Nazirliyi "Respublika Sanitariya-Karantin Mərkəzi" publik hüquqi şəxsi (PHŞ)',
+    "ABADA": "Azərbaycan Beynəlxalq Avtomobil Daşıyıcıları Assosiyası",
+    "İİTKM": "Azərbaycan Respublikası İqtisadi İslahatların Təhlili və Kommunikasiya Mərkəzi",
+    "ASCO": "Azərbaycan Xəzər Dəniz Gəmiçiliyi QSC",
+    "DSX": "Azərbaycan Respublikası Dövlət Sərhəd Xidməti",
+    "AEM": "Azərbaycan Respublikası Səhiyyə Nazirliyi Analitik Ekspertiza Mərkəzi",
+    "DGK": "Azərbaycan Respublikası Dövlət Gömrük Komitəsi",
+    "AYNA": "Azərbaycan Yerüstü Nəqliyyat Agentliyi",
+    "DVX": "Azərbaycan İqtisadiyyat Nazirliyi yanında Dövlət Vergi Xidməti",
+    "İMEM": "Azərbaycan Respublikasının Prezidenti yanında Antiinhisar və İstehlak Bazarına Nəzarət Dövlət Agentliyinin İstehlak Mallarının Ekspertizası Mərkəzi",
+    "BMFM": "Azərbaycan Respublikasının Kənd Təsərrüfatı Nazirliyi yanında Aqrar Xidmətlər Agentliyinin Bitki Mühafizəsi və Fumiqasiya Mərkəzi",
+    "AQTA": "Azərbaycan Respublikasının Qida Təhlükəsizliyi Agentliyi",
+    "PTX": "Azərbaycan Respublikası Prezidentinin Təhlükəsizlik Xidməti",
+    "XRİTDX": "Azərbaycan Respublikasının Xüsusi Rabitə və İnformasiya Təhlükəsizliyi",
+    "AİBND": "Azərbaycan Respublikasının Prezidenti yanında Antiinhisar və İstehlak Bazarına Nəzarət Dövlət Agentliyi",
+    "AMEA": "Azərbaycan Milli Elmlər Akademiyası",
+    "ETN": "Azərbaycan Respublikası Elm və Təhsil Nazirliyi",
+    "AMN": "Azərbaycan Respublikası Mədəniyyət Nazirliyi",
+    "NK": "Azərbaycan Respublikasının Nazirlər Kabineti",
+    "MSN": "Azərbaycan Respublikası Müdafiə Sənayesi Nazirliyi",
+    "DTX": "Azərbaycan Respublikası Dövlət Təhlükəsizlik Xidməti",
+    "AEN": "Azərbaycan Respublikası Energetika Nazirliyi",
+    "ETSN": "Azərbaycan Respublikası Ekologiya və Təbii Sərvətlər Nazirliyi",
+    "ARƏMA": "Azərbaycan Respublikası Əqli Mülkiyyət Agentliyi",
+    "DQİDK": "Azərbaycan Respublikası Dini Qurumlarla İş üzrə Dövlət Komitəsi",
+    "FHN": "Azərbaycan Respublikasının Fövqəladə Hallar Nazirliyi",
+    "RİNN": "Rəqəmsal İnkişaf və Nəqliyyat Nazirliyi",
+    "SN":"Azərbaycan Respublikası Səhiyyə Nazirliyi"
+}
+
+
+def build_organization_query(search_term: str) -> dict:
+    """
+    Build Elasticsearch query for organization search.
+    
+    Args:
+        search_term: The search term (can be full name or abbreviation)
+        
+    Returns:
+        Elasticsearch query dict
+    """
+    # Check if search term is a known abbreviation
+    if search_term.upper() in ORGANIZATION_ABBREVIATIONS.keys():
+        search_term = ORGANIZATION_ABBREVIATIONS[search_term.upper()]
+    
+    # Extract words from search term (split on spaces and periods)
+    words = re.findall(r'([^\s.]+)(?=\.|$)', search_term)
+    
+    if not words:
+        return {"match_none": {}}
+    
+    # Single word search: use fuzzy match or prefix
+    
+    if len(words) <= 1:
+        return {
+            "bool": {
+                "should": [
+                    {
+                        "match": {
+                            "name": {
+                                "query": search_term,
+                                "fuzziness": "AUTO",
+                                "boost": 2.0
+                            }
+                        }
+                    },
+                    {
+                        "prefix": {
+                            "name": {
+                                "value": search_term,
+                                "boost": 3.0
+                            }
+                        }
+                    }
+                ],
+                "minimum_should_match": 1
+            }
+        }
+    
+    
+    # Multiple words: require ALL tokens to match (AND logic)
+    must_clauses = []
+    for token in words:
+        token_should = []
+        
+        # Use fuzziness for tokens >= 3 characters
+        if len(token) >= 3:
+            token_should.append({
+                "match": {
+                    "name": {
+                        "query": token,
+                        "fuzziness": "AUTO"
+                    }
+                }
+            })
+        else:
+            token_should.append({
+                "match": {
+                    "name": {
+                        "query": token
+                    }
+                }
+            })
+        
+        # Add prefix match for better results
+        token_should.append({
+            "prefix": {
+                "name": {
+                    "value": token
+                }
+            }
+        })
+        
+        must_clauses.append({
+            "bool": {
+                "should": token_should,
+                "minimum_should_match": 1
+            }
+        })
+    
     return {
-        "pre_tags": ["<mark>"],
-        "post_tags": ["</mark>"],
-        "fields": {
-            "name_az_d1": {},
-            "name_az_d2": {},
-            "name_az_d3": {},
-            "name_az_d4": {},
-            "keywords_az_level1": {},
-            "keywords_az_level2": {},
-        },
+        "bool": {
+            "must": must_clauses
+        }
     }
 
 
@@ -365,14 +510,17 @@ def build_highlight_config() -> dict:
 # Source Elasticsearch (for BM25 search)
 SOURCE_ES_URL = "http://10.3.3.16:9200"
 SOURCE_ES_API_KEY = ""
-SOURCE_ES_INDEX = "flattened_hscodes_v4"
+SOURCE_ES_INDEX = "flattened_hscodes_v2"
 
 # Destination Elasticsearch (for vector search)
 DEST_ES_URL = "https://8b64d8075c244822b5b7d37c8326f96f.us-central1.gcp.cloud.es.io:443"
 DEST_ES_API_KEY = "Ql9uY1ZKb0JCd0t3WlRBbUo1LUk6V25TQmprTlpUR042dFoxMS1Tb0NPdw=="
 DEST_ES_INDEX = "embedded_words"
 
-MODEL_DIR = "m12_1e"  # Path to your sentence transformer model
+# Organizations index name
+ORGANIZATIONS_INDEX = "organizations_v4"
+
+MODEL_DIR = r""  # Path to your sentence transformer model
 
 app = FastAPI(
     title="Hybrid Search API with Vector Search",
@@ -382,7 +530,7 @@ app = FastAPI(
 
 
 def load_model():
-    """Load the sentence transformer model"""
+    #Load the sentence transformer model
     print(f"Loading model from: {MODEL_DIR}")
     try:
         model = SentenceTransformer(MODEL_DIR)
@@ -392,17 +540,22 @@ def load_model():
         print(f"⚠️ Warning: Could not load model from {MODEL_DIR}: {e}")
         print("Vector search will be disabled.")
         return None
+    
 
 
 @app.on_event("startup")
 async def startup():
     """Initialize Elasticsearch connections and load model on startup"""
     # Connect to source ES for BM25 search
-    app.state.es_source = AsyncElasticsearch(hosts=[SOURCE_ES_URL], api_key=SOURCE_ES_API_KEY)
+    es_headers = {
+    "Accept": "application/vnd.elasticsearch+json; compatible-with=8",
+    "Content-Type": "application/vnd.elasticsearch+json; compatible-with=8"
+}
+    app.state.es_source = AsyncElasticsearch(hosts=[SOURCE_ES_URL], api_key=SOURCE_ES_API_KEY, headers=es_headers)
     print(f"✅ Connected to Source Elasticsearch at {SOURCE_ES_URL}")
     
     # Connect to destination ES for vector search
-    app.state.es_dest = AsyncElasticsearch(hosts=[DEST_ES_URL], api_key=DEST_ES_API_KEY)
+    app.state.es_dest = AsyncElasticsearch(hosts=[DEST_ES_URL], api_key=DEST_ES_API_KEY, headers=es_headers)
     print(f"✅ Connected to Destination Elasticsearch at {DEST_ES_URL}")
     
     # Load the embedding model
@@ -438,8 +591,6 @@ async def search(req: SearchRequest) -> HybridRetrievedResponseSet:
     # Check if vector search is enabled and model is available
     use_vector_search = req.use_vector and app.state.model is not None
     
-    highlight_conf = build_highlight_config() if req.use_highlight else None
-
     if use_vector_search:
         # Generate query embedding (run in thread pool to avoid blocking)
         loop = asyncio.get_event_loop()
@@ -451,24 +602,20 @@ async def search(req: SearchRequest) -> HybridRetrievedResponseSet:
         # Build hybrid query with vector similarity
         es_query = build_hybrid_vector_query(req, query_vector)
         
-        es_query = build_es_bool_query(req)
-
+        # Use destination ES with embeddings
         try:
-            search_kwargs = {
-                "index": SOURCE_ES_INDEX,
-                "query": es_query,
-                "size": req.size,
-            }
-            if highlight_conf:
-                search_kwargs["highlight"] = highlight_conf
-
-            resp = await app.state.es_source.search(**search_kwargs)
+            resp = await app.state.es_dest.search(
+                index=DEST_ES_INDEX,
+                query=es_query,
+                size=req.size
+            )
         except Exception as e:
             raise HTTPException(
                 status_code=502,
-                detail=f"Elasticsearch (BM25) error: {e}"
+                detail=f"Elasticsearch (vector) error: {e}"
             )
         
+        # Parse hits from vector search
         hits_data = (resp or {}).get("hits", {})
         hits = hits_data.get("hits", []) or []
         total_hits = hits_data.get("total", {})
@@ -484,37 +631,28 @@ async def search(req: SearchRequest) -> HybridRetrievedResponseSet:
         # Fetch full documents from source ES using codes
         if vector_results:
             try:
+                # Build a query to fetch documents by codes
                 codes_list = list(vector_results.keys())
-
-                fetch_query = {
-                    "terms": {
-                        "code": codes_list
-                    }
-                }
-
-                fetch_kwargs = {
-                    "index": SOURCE_ES_INDEX,
-                    "query": fetch_query,
-                    "size": len(codes_list),
-                }
-
-                if highlight_conf:
-                    # use the BM25 style bool query to drive highlighting
-                    fetch_highlight = {
-                        **highlight_conf,
-                        "highlight_query": build_es_bool_query(req),
-                    }
-                    fetch_kwargs["highlight"] = fetch_highlight
-
-                fetch_resp = await app.state.es_source.search(**fetch_kwargs)
+                fetch_resp = await app.state.es_source.search(
+                    index=SOURCE_ES_INDEX,
+                    query={
+                        "terms": {
+                            "code": codes_list
+                        }
+                    },
+                    size=len(codes_list)
+                )
                 
+                # Build a map of code -> full document
                 full_docs = {}
                 for hit in fetch_resp.get("hits", {}).get("hits", []):
                     code = hit.get("_source", {}).get("code")
                     if code:
+                        # Replace the score with the vector search score
                         hit["_score"] = vector_results.get(code, 0.0)
                         full_docs[code] = hit
                 
+                # Rebuild hits in the order of vector search results
                 enriched_hits = []
                 for code in codes_list:
                     if code in full_docs:
@@ -566,6 +704,82 @@ async def search(req: SearchRequest) -> HybridRetrievedResponseSet:
         }
     )
 
+@app.post(
+    "/organizations",
+    response_model=OrganizationSearchResponse,
+    response_model_by_alias=True,
+    summary="Search Organizations",
+    description="Search for organizations by name or abbreviation"
+)
+async def search_organizations(req: OrganizationSearchRequest) -> OrganizationSearchResponse:
+    """
+    Search for organizations in Elasticsearch.
+    
+    Args:
+        req: OrganizationSearchRequest containing search term, index, and size
+        
+    Returns:
+        OrganizationSearchResponse with ranked search results
+    """
+    # Build Elasticsearch query
+    es_query = build_organization_query(req.search_term)
+    
+    print(f"Organization search query for '{req.search_term}':", es_query)
+    
+    # Execute search against source Elasticsearch
+    try:
+        resp = await app.state.es_source.search(
+            index=req.index,
+            query=es_query,
+            size=req.size
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Elasticsearch error: {e}"
+        )
+    
+    # Parse response
+    hits_data = resp.get("hits", {})
+    hits = hits_data.get("hits", []) or []
+    total_hits = hits_data.get("total", {})
+    
+    # Extract total count
+    if isinstance(total_hits, dict):
+        total_count = total_hits.get("value", 0)
+    else:
+        total_count = total_hits or 0
+    
+    # Convert hits to OrganizationDocument objects
+    results = [OrganizationDocument.from_es_hit(hit) for hit in hits]
+    
+    # Return structured response
+    return OrganizationSearchResponse(
+        **{
+            "search-term": req.search_term,
+            "total-hits": total_count,
+            "results": results
+        }
+    )
+
+
+# Example usage:
+"""
+curl -X POST "http://localhost:8000/organizations" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "search_term": "DGK",
+    "size": 10
+  }'
+
+curl -X POST "http://localhost:8000/organizations" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "search_term": "Dövlət Gömrük",
+    "index": "organizations_v4",
+    "size": 5
+  }'
+"""
 
 @app.get("/health", summary="Health Check")
 async def health_check():
@@ -597,7 +811,6 @@ async def health_check():
             "model": "unknown"
         }
 
-
 # ==================== Run Instructions ====================
 # To run this application:
 # 1. Install dependencies: 
@@ -609,17 +822,19 @@ async def health_check():
 # Example requests:
 # 
 # Using size parameter:
-# curl -X POST "http://localhost:8000/search" \
-#   -H "Content-Type: application/json" \
-#   -d '{
-#     "query": "aluminium",
-#     "filter": {
-#       "trade_type": "TRANSIT",
-#       "in_vehicle_ids": ["avtomobil"]
-#     },
-#     "size": 10,
-#     "use_vector": false
-#   }'
+"""
+ curl -X POST "http://localhost:8000/search" \
+   -H "Content-Type: application/json" \
+   -d '{
+     "query": "aluminium",
+     "filter": {
+       "trade_type": "TRANSIT",
+       "in_vehicle_ids": ["avtomobil"]
+     },
+     "size": 10,
+     "use_vector": false
+   }'
+"""
 #
 # Using top_k parameter (same as size):
 # curl -X POST "http://localhost:8000/search" \
@@ -637,3 +852,5 @@ async def health_check():
 #   }'
 #
 # Note: top_k is an alias for size. You can use either parameter.
+
+
