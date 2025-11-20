@@ -765,20 +765,9 @@ async def search_organizations(req: OrganizationSearchRequest) -> OrganizationSe
 
 # Example usage:
 """
-curl -X POST "http://localhost:8000/organizations" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "search_term": "DGK",
-    "size": 10
-  }'
+curl.exe -X POST "http://localhost:8080/organizations" -H "Content-Type: application/json" -d '{\"search_term\": \"məd.naz\", \"index\": \"organizations_v3\", \"size\": 10}'
+NOTE: organizations_v4 health was red, because of that i used organizations_v3 for test
 
-curl -X POST "http://localhost:8000/organizations" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "search_term": "Dövlət Gömrük",
-    "index": "organizations_v4",
-    "size": 5
-  }'
 """
 
 @app.get("/health", summary="Health Check")
@@ -852,5 +841,6 @@ async def health_check():
 #   }'
 #
 # Note: top_k is an alias for size. You can use either parameter.
+
 
 
