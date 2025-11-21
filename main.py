@@ -314,22 +314,42 @@ def build_hybrid_vector_query(req: SearchRequest, query_vector: List[float]) -> 
     base_query = build_es_bool_query(req)
     # Extract the bool query from function_score
     bool_query = base_query["bool"]
+
+    # Parent weights
+    parent_coefficient = 0.3
+    parent_fields = {
+        "embedding_d1": 1.0 * parent_coefficient,
+        "embedding_d2": 1.5 * parent_coefficient,
+        "embedding_d3": 2.0 * parent_coefficient,
+        "embedding_d4": 1.0  # main leaf, full weight
+    }
     
     # Build script_score query for hybrid search
     query = {
         "script_score": {
-            "query": {
-                "bool": bool_query
-            },
+            "query": {"bool": bool_query},
             "script": {
                 "source": """
+                double cosine = 0.0;
+                
+                // Level embeddings
+                cosine += params.alpha_level1 * (cosineSimilarity(params.query_vector, 'embedding_d1') + 1.0)/2.0;
+                cosine += params.alpha_level2 * (cosineSimilarity(params.query_vector, 'embedding_d2') + 1.0)/2.0;
+                cosine += params.alpha_level3 * (cosineSimilarity(params.query_vector, 'embedding_d3') + 1.0)/2.0;
+                cosine += params.alpha_level4 * (cosineSimilarity(params.query_vector, 'embedding_d4') + 1.0)/2.0;
+                
+                // BM25 score stays unchanged
                 double bm25 = _score / (_score + 10.0);
-                double cosine = (cosineSimilarity(params.query_vector, 'embedding') + 1.0) / 2.0;
+                
                 return params.alpha * cosine + (1 - params.alpha) * bm25;
                 """,
                 "params": {
                     "query_vector": query_vector,
-                    "alpha": req.alpha
+                    "alpha": req.alpha,
+                    "alpha_level1": parent_fields["embedding_d1"],
+                    "alpha_level2": parent_fields["embedding_d2"],
+                    "alpha_level3": parent_fields["embedding_d3"],
+                    "alpha_level4": parent_fields["embedding_d4"],
                 }
             }
         }
@@ -360,9 +380,9 @@ SOURCE_ES_API_KEY = ""
 SOURCE_ES_INDEX = "flattened_hscodes_v4"
 
 # Destination Elasticsearch (for vector search)
-DEST_ES_URL = "https://8b64d8075c244822b5b7d37c8326f96f.us-central1.gcp.cloud.es.io:443"
-DEST_ES_API_KEY = "Ql9uY1ZKb0JCd0t3WlRBbUo1LUk6V25TQmprTlpUR042dFoxMS1Tb0NPdw=="
-DEST_ES_INDEX = "embedded_words"
+DEST_ES_URL = "http://10.3.3.16:9200"
+DEST_ES_API_KEY = ""
+DEST_ES_INDEX = "flattened_hscodes_v4_copy"
 
 MODEL_DIR = "m12_1e"  # Path to your sentence transformer model
 
@@ -443,8 +463,6 @@ async def search(req: SearchRequest) -> HybridRetrievedResponseSet:
         # Build hybrid query with vector similarity
         es_query = build_hybrid_vector_query(req, query_vector)
         
-        es_query = build_es_bool_query(req)
-
         try:
             search_kwargs = {
                 "index": SOURCE_ES_INDEX,
