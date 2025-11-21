@@ -6,6 +6,14 @@ from elasticsearch import AsyncElasticsearch
 from sentence_transformers import SentenceTransformer
 import re
 import asyncio
+import logging
+
+# ==================== Setup Logging ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # ==================== Data Models ====================
 
@@ -94,7 +102,7 @@ class ElasticDocument(BaseModel):
             name_az_d4=src.get("name_az_d4"),
             tradings=tradings,
             Path=path or src.get("Path"),
-            highlight=hit.get("highlight"),  # new
+            highlight=hit.get("highlight"),
         )
 
 
@@ -115,7 +123,7 @@ class SearchRequest(BaseModel):
     top_k: Optional[int] = Field(default=None, ge=1, le=200, description="Alias for size parameter (number of top results)")
     alpha: float = Field(default=0.5, ge=0.0, le=1.0, description="Weight for vector similarity (0=BM25 only, 1=vector only)")
     use_vector: bool = Field(default=True, description="Enable vector search in hybrid mode")
-    use_highlight: bool = Field(default=False, description="Return Elasticsearch highlight snippets")  # new
+    use_highlight: bool = Field(default=False, description="Return Elasticsearch highlight snippets")
     
     def model_post_init(self, __context):
         if self.top_k is not None:
@@ -123,7 +131,6 @@ class SearchRequest(BaseModel):
 
 
 # ==================== Query Builder ====================
-import re
 
 def build_es_bool_query(req: SearchRequest) -> dict:
     f = req.filter
@@ -298,21 +305,18 @@ def build_es_bool_query(req: SearchRequest) -> dict:
     if filters:
         bool_query["filter"] = filters
     
-    query = {
-        "bool": bool_query
-        }
-
-    print("Constructed ES Query:", query)
+    query = {"bool": bool_query}
+    
+    logger.info(f"Constructed BM25 bool query: {query}")
     
     return query
 
 def build_hybrid_vector_query(req: SearchRequest, query_vector: List[float]) -> dict:
     """Build hybrid query combining BM25 and vector similarity with filters"""
-    f = req.filter
+    logger.info(f"Building hybrid vector query with alpha={req.alpha}")
     
-    # Build the base BM25 query (without function_score wrapper)
+    # Build the base BM25 query
     base_query = build_es_bool_query(req)
-    # Extract the bool query from function_score
     bool_query = base_query["bool"]
 
     # Parent weights
@@ -324,7 +328,11 @@ def build_hybrid_vector_query(req: SearchRequest, query_vector: List[float]) -> 
         "embedding_d4": 1.0  # main leaf, full weight
     }
     
-    # Build script_score query for hybrid search
+    logger.info(f"Embedding weights: d1={parent_fields['embedding_d1']}, "
+                f"d2={parent_fields['embedding_d2']}, d3={parent_fields['embedding_d3']}, "
+                f"d4={parent_fields['embedding_d4']}")
+    
+    # Build script_score query for hybrid search with null checks
     query = {
         "script_score": {
             "query": {"bool": bool_query},
@@ -332,15 +340,24 @@ def build_hybrid_vector_query(req: SearchRequest, query_vector: List[float]) -> 
                 "source": """
                 double cosine = 0.0;
                 
-                // Level embeddings
-                cosine += params.alpha_level1 * (cosineSimilarity(params.query_vector, 'embedding_d1') + 1.0)/2.0;
-                cosine += params.alpha_level2 * (cosineSimilarity(params.query_vector, 'embedding_d2') + 1.0)/2.0;
-                cosine += params.alpha_level3 * (cosineSimilarity(params.query_vector, 'embedding_d3') + 1.0)/2.0;
-                cosine += params.alpha_level4 * (cosineSimilarity(params.query_vector, 'embedding_d4') + 1.0)/2.0;
+                // Level embeddings with null/empty checks
+                if (doc.containsKey('embedding_d1') && doc['embedding_d1'].size() > 0) {
+                    cosine += params.alpha_level1 * (cosineSimilarity(params.query_vector, 'embedding_d1') + 1.0)/2.0;
+                }
+                if (doc.containsKey('embedding_d2') && doc['embedding_d2'].size() > 0) {
+                    cosine += params.alpha_level2 * (cosineSimilarity(params.query_vector, 'embedding_d2') + 1.0)/2.0;
+                }
+                if (doc.containsKey('embedding_d3') && doc['embedding_d3'].size() > 0) {
+                    cosine += params.alpha_level3 * (cosineSimilarity(params.query_vector, 'embedding_d3') + 1.0)/2.0;
+                }
+                if (doc.containsKey('embedding_d4') && doc['embedding_d4'].size() > 0) {
+                    cosine += params.alpha_level4 * (cosineSimilarity(params.query_vector, 'embedding_d4') + 1.0)/2.0;
+                }
                 
-                // BM25 score stays unchanged
+                // BM25 score normalization
                 double bm25 = _score / (_score + 10.0);
                 
+                // Hybrid score calculation
                 return params.alpha * cosine + (1 - params.alpha) * bm25;
                 """,
                 "params": {
@@ -354,6 +371,8 @@ def build_hybrid_vector_query(req: SearchRequest, query_vector: List[float]) -> 
             }
         }
     }
+    
+    logger.info(f"Built script_score query with vector dimension: {len(query_vector)}")
     
     return query
 
@@ -374,17 +393,12 @@ def build_highlight_config() -> dict:
 
 # ==================== FastAPI Application ====================
 
-# Source Elasticsearch (for BM25 search)
-SOURCE_ES_URL = "http://10.3.3.16:9200"
-SOURCE_ES_API_KEY = ""
-SOURCE_ES_INDEX = "flattened_hscodes_v4"
+# Since both source and dest are the same, we only need one connection
+ES_URL = "http://10.3.3.16:9200"
+ES_API_KEY = ""
+ES_INDEX = "flattened_hscodes_v4_copy"
 
-# Destination Elasticsearch (for vector search)
-DEST_ES_URL = "http://10.3.3.16:9200"
-DEST_ES_API_KEY = ""
-DEST_ES_INDEX = "flattened_hscodes_v4_copy"
-
-MODEL_DIR = "m12_1e"  # Path to your sentence transformer model
+MODEL_DIR = "m12_1e"
 
 app = FastAPI(
     title="Hybrid Search API with Vector Search",
@@ -395,27 +409,22 @@ app = FastAPI(
 
 def load_model():
     """Load the sentence transformer model"""
-    print(f"Loading model from: {MODEL_DIR}")
+    logger.info(f"Loading model from: {MODEL_DIR}")
     try:
         model = SentenceTransformer(MODEL_DIR)
-        print(f"✅ Model loaded successfully. Embedding dimension: {model.get_sentence_embedding_dimension()}")
+        logger.info(f"✅ Model loaded successfully. Embedding dimension: {model.get_sentence_embedding_dimension()}")
         return model
     except Exception as e:
-        print(f"⚠️ Warning: Could not load model from {MODEL_DIR}: {e}")
-        print("Vector search will be disabled.")
+        logger.warning(f"⚠️ Warning: Could not load model from {MODEL_DIR}: {e}")
+        logger.warning("Vector search will be disabled.")
         return None
 
 
 @app.on_event("startup")
 async def startup():
-    """Initialize Elasticsearch connections and load model on startup"""
-    # Connect to source ES for BM25 search
-    app.state.es_source = AsyncElasticsearch(hosts=[SOURCE_ES_URL], api_key=SOURCE_ES_API_KEY)
-    print(f"✅ Connected to Source Elasticsearch at {SOURCE_ES_URL}")
-    
-    # Connect to destination ES for vector search
-    app.state.es_dest = AsyncElasticsearch(hosts=[DEST_ES_URL], api_key=DEST_ES_API_KEY)
-    print(f"✅ Connected to Destination Elasticsearch at {DEST_ES_URL}")
+    """Initialize Elasticsearch connection and load model on startup"""
+    app.state.es = AsyncElasticsearch(hosts=[ES_URL], api_key=ES_API_KEY)
+    logger.info(f"✅ Connected to Elasticsearch at {ES_URL}")
     
     # Load the embedding model
     app.state.model = load_model()
@@ -423,10 +432,9 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    """Close Elasticsearch connections on shutdown"""
-    await app.state.es_source.close()
-    await app.state.es_dest.close()
-    print("Elasticsearch connections closed")
+    """Close Elasticsearch connection on shutdown"""
+    await app.state.es.close()
+    logger.info("Elasticsearch connection closed")
 
 
 @app.post(
@@ -447,12 +455,20 @@ async def search(req: SearchRequest) -> HybridRetrievedResponseSet:
         HybridRetrievedResponseSet with ranked search results
     """
     
+    logger.info(f"Search request: query='{req.query}', size={req.size}, "
+                f"use_vector={req.use_vector}, alpha={req.alpha}")
+    
     # Check if vector search is enabled and model is available
     use_vector_search = req.use_vector and app.state.model is not None
+    
+    if req.use_vector and app.state.model is None:
+        logger.warning("Vector search requested but model is not loaded. Falling back to BM25.")
     
     highlight_conf = build_highlight_config() if req.use_highlight else None
 
     if use_vector_search:
+        logger.info("Using HYBRID search mode (BM25 + Vector)")
+        
         # Generate query embedding (run in thread pool to avoid blocking)
         loop = asyncio.get_event_loop()
         query_vector = await loop.run_in_executor(
@@ -460,95 +476,60 @@ async def search(req: SearchRequest) -> HybridRetrievedResponseSet:
             lambda: app.state.model.encode(req.query).tolist()
         )
         
+        logger.info(f"Generated query embedding with {len(query_vector)} dimensions")
+        
         # Build hybrid query with vector similarity
         es_query = build_hybrid_vector_query(req, query_vector)
         
         try:
             search_kwargs = {
-                "index": SOURCE_ES_INDEX,
+                "index": ES_INDEX,
                 "query": es_query,
                 "size": req.size,
             }
             if highlight_conf:
                 search_kwargs["highlight"] = highlight_conf
+                logger.info("Highlighting enabled")
 
-            resp = await app.state.es_source.search(**search_kwargs)
+            logger.info(f"Executing hybrid search on index: {ES_INDEX}")
+            resp = await app.state.es.search(**search_kwargs)
+            logger.info(f"Hybrid search completed successfully")
+            
         except Exception as e:
+            logger.error(f"Elasticsearch hybrid search error: {e}", exc_info=True)
             raise HTTPException(
                 status_code=502,
-                detail=f"Elasticsearch (BM25) error: {e}"
+                detail=f"Elasticsearch (hybrid) error: {e}"
             )
         
         hits_data = (resp or {}).get("hits", {})
         hits = hits_data.get("hits", []) or []
         total_hits = hits_data.get("total", {})
         
-        # Extract codes and scores from vector search results
-        vector_results = {}
-        for hit in hits:
-            code = hit.get("_source", {}).get("code")
-            score = hit.get("_score")
-            if code:
-                vector_results[code] = score
+        logger.info(f"Retrieved {len(hits)} hits from hybrid search")
         
-        # Fetch full documents from source ES using codes
-        if vector_results:
-            try:
-                codes_list = list(vector_results.keys())
-
-                fetch_query = {
-                    "terms": {
-                        "code": codes_list
-                    }
-                }
-
-                fetch_kwargs = {
-                    "index": SOURCE_ES_INDEX,
-                    "query": fetch_query,
-                    "size": len(codes_list),
-                }
-
-                if highlight_conf:
-                    # use the BM25 style bool query to drive highlighting
-                    fetch_highlight = {
-                        **highlight_conf,
-                        "highlight_query": build_es_bool_query(req),
-                    }
-                    fetch_kwargs["highlight"] = fetch_highlight
-
-                fetch_resp = await app.state.es_source.search(**fetch_kwargs)
-                
-                full_docs = {}
-                for hit in fetch_resp.get("hits", {}).get("hits", []):
-                    code = hit.get("_source", {}).get("code")
-                    if code:
-                        hit["_score"] = vector_results.get(code, 0.0)
-                        full_docs[code] = hit
-                
-                enriched_hits = []
-                for code in codes_list:
-                    if code in full_docs:
-                        enriched_hits.append(full_docs[code])
-                
-                hits = enriched_hits
-                
-            except Exception as e:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Elasticsearch (source fetch) error: {e}"
-                )
     else:
+        logger.info("Using BM25-only search mode")
+        
         # Build standard BM25 query
         es_query = build_es_bool_query(req)
         
-        # Use source ES for BM25 search
         try:
-            resp = await app.state.es_source.search(
-                index=SOURCE_ES_INDEX,
-                query=es_query,
-                size=req.size
-            )
+            search_kwargs = {
+                "index": ES_INDEX,
+                "query": es_query,
+                "size": req.size,
+            }
+            if highlight_conf:
+                search_kwargs["highlight"] = highlight_conf
+                logger.info("Highlighting enabled")
+            
+            logger.info(f"Executing BM25 search on index: {ES_INDEX}")
+            resp = await app.state.es.search(**search_kwargs)
+            logger.info(f"BM25 search completed successfully")
+            
         except Exception as e:
+            logger.error(f"Elasticsearch BM25 search error: {e}", exc_info=True)
             raise HTTPException(
                 status_code=502,
                 detail=f"Elasticsearch (BM25) error: {e}"
@@ -558,6 +539,8 @@ async def search(req: SearchRequest) -> HybridRetrievedResponseSet:
         hits_data = (resp or {}).get("hits", {})
         hits = hits_data.get("hits", []) or []
         total_hits = hits_data.get("total", {})
+        
+        logger.info(f"Retrieved {len(hits)} hits from BM25 search")
     
     # Extract total count (Elasticsearch can return this in different formats)
     if isinstance(total_hits, dict):
@@ -565,7 +548,17 @@ async def search(req: SearchRequest) -> HybridRetrievedResponseSet:
     else:
         total_count = total_hits or 0
     
+    logger.info(f"Total hits available: {total_count}")
+    
     ranked = [ElasticDocument.from_es_hit(h) for h in hits]
+    
+    # Log top 3 results
+    if ranked:
+        logger.info(f"Top result: code={ranked[0].code}, score={ranked[0].score:.4f}")
+        if len(ranked) > 1:
+            logger.info(f"2nd result: code={ranked[1].code}, score={ranked[1].score:.4f}")
+        if len(ranked) > 2:
+            logger.info(f"3rd result: code={ranked[2].code}, score={ranked[2].score:.4f}")
     
     # Return response with all required fields
     return HybridRetrievedResponseSet(
@@ -579,71 +572,29 @@ async def search(req: SearchRequest) -> HybridRetrievedResponseSet:
 
 @app.get("/health", summary="Health Check")
 async def health_check():
-    """Check if the service, Elasticsearch connections, and model are healthy"""
+    """Check if the service, Elasticsearch connection, and model are healthy"""
     try:
-        es_source_health = await app.state.es_source.info()
-        es_dest_health = await app.state.es_dest.info()
+        es_health = await app.state.es.info()
         model_status = "loaded" if app.state.model is not None else "not loaded"
         
         return {
             "status": "healthy",
-            "elasticsearch_source": {
+            "elasticsearch": {
                 "status": "connected",
-                "cluster_name": es_source_health.get("cluster_name"),
-                "url": SOURCE_ES_URL
+                "cluster_name": es_health.get("cluster_name"),
+                "url": ES_URL,
+                "index": ES_INDEX
             },
-            "elasticsearch_dest": {
-                "status": "connected",
-                "cluster_name": es_dest_health.get("cluster_name"),
-                "url": DEST_ES_URL
+            "model": {
+                "status": model_status,
+                "path": MODEL_DIR
             },
-            "model": model_status,
             "vector_search": "enabled" if app.state.model else "disabled"
         }
     except Exception as e:
+        logger.error(f"Health check failed: {e}", exc_info=True)
         return {
             "status": "unhealthy",
             "error": str(e),
             "model": "unknown"
         }
-
-
-# ==================== Run Instructions ====================
-# To run this application:
-# 1. Install dependencies: 
-#    pip install fastapi uvicorn elasticsearch sentence-transformers
-# 2. Ensure your model directory exists at MODEL_DIR path
-# 3. Run: uvicorn main:app --reload
-# 4. API docs available at: http://localhost:8000/docs
-#
-# Example requests:
-# 
-# Using size parameter:
-# curl -X POST "http://localhost:8000/search" \
-#   -H "Content-Type: application/json" \
-#   -d '{
-#     "query": "aluminium",
-#     "filter": {
-#       "trade_type": "TRANSIT",
-#       "in_vehicle_ids": ["avtomobil"]
-#     },
-#     "size": 10,
-#     "use_vector": false
-#   }'
-#
-# Using top_k parameter (same as size):
-# curl -X POST "http://localhost:8000/search" \
-#   -H "Content-Type: application/json" \
-#   -d '{
-#     "query": "metal",
-#     "filter": {
-#       "trade_type": "IMPORT",
-#       "in_vehicle_ids": ["deniz", "avtomobil"],
-#       "out_vehicle_ids": ["avtomobil"]
-#     },
-#     "top_k": 10,
-#     "alpha": 0.6,
-#     "use_vector": true
-#   }'
-#
-# Note: top_k is an alias for size. You can use either parameter.
