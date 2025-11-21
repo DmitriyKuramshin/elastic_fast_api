@@ -129,17 +129,23 @@ def build_es_bool_query(req: SearchRequest) -> dict:
     f = req.filter
 
     query_text = req.query.strip()
-    
+
     numeric_code = re.sub(r'\D', '', query_text)
     has_code = len(numeric_code) >= 6
     
-    is_only_code = query_text.isdigit() and len(query_text) in [6, 8, 10]
-    
+    is_only_code = query_text.isdigit() and len(query_text) in [6, 8, 10]    
+
+    # (field_name, boost)
+    field_configs = [
+        ("keywords_az_level1", 6),
+        ("name_az_d4", 5),
+        ("keywords_az_level2", 4),
+        ("name_az_d3", 3),
+        ("name_az_d2", 2),
+        ("name_az_d1", 1),
+    ]
+
     should_clauses = []
-    
-    parent_coefficient = 0.3
-    
-    # If query is only a code, use exact prefix matching only
     if is_only_code:
         should_clauses.append({
             "prefix": {
@@ -149,58 +155,65 @@ def build_es_bool_query(req: SearchRequest) -> dict:
                 }
             }
         })
-    else:
-        # 1) Exact match phrase for name_az_d4
-        should_clauses.append({
-            "match_phrase": {
-                "name_az_d4": {
-                    "query": query_text,
-                    "boost": 16.0, 
-                    "slop": 1
+    else:             
+        for field, boost in field_configs:
+            # match_phrase
+            should_clauses.append({
+                "match_phrase": {
+                    field: {
+                        "query": query_text,
+                        "boost": boost,
+                        "slop": 1,
+                    }
                 }
-            }
-        })
+            })
 
-        # 2) Main fuzzy match for name_az_d4 with match_phrase_prefix
-        should_clauses.append({
-            "match": {
-                "name_az_d4": {
-                    "query": query_text,
-                    "boost": 8.0,
-                    "fuzziness": "2",
+            # match with fuzziness
+            should_clauses.append({
+                "match": {
+                    field: {
+                        "query": query_text,
+                        "boost": boost,
+                        "fuzziness": "AUTO",
+                        "prefix_length": 2,
+                    }
                 }
-            }
-        })
+            })
 
-        should_clauses.append({
-            "match_phrase_prefix": {
-                "name_az_d4": {
-                    "query": query_text,
-                    "max_expansions": 8.0
+            # match_phrase_prefix
+            should_clauses.append({
+                "match_phrase_prefix": {
+                    field: {
+                        "query": query_text,
+                        "boost": boost,
+                        "max_expansions": 8,
+                    }
                 }
-            }
-        })
+            })
 
-        # 3) Keywords search - match query with moderate boost
-        should_clauses.append({
-            "match": {
-                "keywords_az_level1": {
-                    "query": query_text,
-                    "boost": 20,
-                    "fuzziness": "2",
+            # span_near with fuzzy span_multi
+            should_clauses.append({
+                "span_near": {
+                    "clauses": [
+                        {
+                            "span_multi": {
+                                "match": {
+                                    "fuzzy": {
+                                        field: {
+                                            "value": query_text,
+                                            "fuzziness": "AUTO",
+                                            "prefix_length": 2,
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    ],
+                    "slop": 2,
+                    "in_order": False,
+                    "boost": boost,
                 }
-            }
-        })
-
-        should_clauses.append({
-            "match": {
-                "keywords_az_level2": {
-                    "query": query_text,
-                    "boost": 12,
-                    "fuzziness": "1",
-                }
-            }
-        })
+            })
 
         # Add code prefix queries with tiered boosting if numeric code is detected
         if has_code:
@@ -238,31 +251,11 @@ def build_es_bool_query(req: SearchRequest) -> dict:
                     }
                 })
 
-        # Parent fields with coefficient applied to their boosting
-        parent_fields = [
-            ("name_az_d1", 1.0),
-            ("name_az_d2", 1.5),
-            ("name_az_d3", 2.0),
-        ]
-        
-        for field, boost in parent_fields:
-            # 1) Fuzzy match with prefix_length
-            should_clauses.append({
-                "match": {
-                    field: {
-                        "query": req.query,
-                        "boost": boost * parent_coefficient,
-                        "fuzziness": "1",
-                        "prefix_length": 2
-                    }
-                }
-            })
-    
     bool_query = {
         "should": should_clauses,
         "minimum_should_match": 1
     }
-    
+
     filters = []
     
     # Apply filters with AND logic: trade_type AND vehicle_ids must match together
@@ -312,7 +305,6 @@ def build_es_bool_query(req: SearchRequest) -> dict:
     print("Constructed ES Query:", query)
     
     return query
-
 
 def build_hybrid_vector_query(req: SearchRequest, query_vector: List[float]) -> dict:
     """Build hybrid query combining BM25 and vector similarity with filters"""
